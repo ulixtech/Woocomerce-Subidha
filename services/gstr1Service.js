@@ -17,20 +17,32 @@ const STATE_CODES = {
   'Daman & Diu': '25', 'Dadra & Nagar Haveli': '26', 'Maharashtra': '27',
   'Andhra Pradesh (Old)': '28', 'Karnataka': '29', 'Goa': '30', 'Lakshadweep': '31',
   'Kerala': '32', 'Tamil Nadu': '33', 'Puducherry': '34', 'Andaman & Nicobar Islands': '35',
-  'Telangana': '36', 'Andhra Pradesh (Newly Added)': '37', 'Ladakh (Newly Added)': '38',
+  'Telangana': '36', 'Andhra Pradesh': '37', 'Ladakh': '38',
   'Others Territory': '97', 'Center Jurisdiction': '99'
 };
 
-// Reverse Map: "07" → "Delhi"
 const STATE_CODE_TO_NAME = Object.fromEntries(
   Object.entries(STATE_CODES).map(([name, code]) => [code, name])
 );
 
-/* ------------------------------------------------------------------------------------------------
-   GST TAX SPLIT (INTRA / INTER STATE)
------------------------------------------------------------------------------------------------- */
-function calculateGstSplit(totalTax, placeOfSupply) {
-  const isIntrastate = (placeOfSupply || '').toLowerCase().includes('west bengal');
+/* Convert state_name to formatted POS like "19-West Bengal" */
+function formatPlaceOfSupplyFromName(stateName) {
+  if (!stateName) return "97-Other Territory";
+  const nameClean = stateName.trim().toLowerCase();
+  for (const [name, code] of Object.entries(STATE_CODES)) {
+    if (name.toLowerCase() === nameClean) return `${code}-${name}`;
+  }
+  for (const [name, code] of Object.entries(STATE_CODES)) {
+    if (name.toLowerCase().includes(nameClean) || nameClean.includes(name.toLowerCase())) {
+      return `${code}-${name}`;
+    }
+  }
+  return "97-Other Territory";
+}
+
+/* GST SPLIT */
+function calculateGstSplit(totalTax, stateName) {
+  const isIntrastate = (stateName || '').toLowerCase().includes('west bengal');
   totalTax = parseFloat(totalTax || 0);
   return {
     igst: isIntrastate ? 0 : totalTax,
@@ -39,9 +51,7 @@ function calculateGstSplit(totalTax, placeOfSupply) {
   };
 }
 
-/* ------------------------------------------------------------------------------------------------
-   HSN CUSTOM DESCRIPTIONS
------------------------------------------------------------------------------------------------- */
+/* HSN EXTRA DESCRIPTION MAP */
 const HSN_DESCRIPTION_MAP = {
   "85238020": {
     description:
@@ -52,7 +62,7 @@ const HSN_DESCRIPTION_MAP = {
 };
 
 /* ------------------------------------------------------------------------------------------------
-   FETCH: B2B DATA (POS FIXED FROM GSTIN)
+   FETCH B2B DATA (POS from GSTIN)
 ------------------------------------------------------------------------------------------------ */
 async function fetchB2BData(startDate, endDate) {
   const query = `
@@ -62,7 +72,7 @@ async function fetchB2BData(startDate, endDate) {
       O.order_total_amount AS invoice_value,
       O.order_subtotal_amount AS taxable_value,
       C.gst_number AS recipient_gstin,
-      C.party_name AS receiver_name,
+      C.company_billing AS receiver_name,
       (SELECT DISTINCT I.gst_rate FROM order_items I WHERE I.order_id = O.id LIMIT 1) AS gst_rate_applied
     FROM orders O
     INNER JOIN customers C ON O.customer_id = C.id
@@ -70,6 +80,7 @@ async function fetchB2BData(startDate, endDate) {
       AND O.order_date BETWEEN :startDate AND :endDate
     ORDER BY O.order_date ASC;
   `;
+
   const rows = await sequelize.query(query, { replacements: { startDate, endDate }, type: QueryTypes.SELECT });
 
   return rows.map(r => {
@@ -77,13 +88,12 @@ async function fetchB2BData(startDate, endDate) {
     const stateCode = gstin.substring(0, 2) || "97";
     const stateName = STATE_CODE_TO_NAME[stateCode] || "Others Territory";
     const placeOfSupply = `${stateCode}-${stateName}`;
-
     return {
       ...r,
       taxable_value: parseFloat(r.taxable_value || 0),
       invoice_value: parseFloat(r.invoice_value || 0),
       gst_rate_applied: parseFloat(r.gst_rate_applied || 0),
-      place_of_supply: placeOfSupply  // ✅ Correct POS derived from GSTIN
+      place_of_supply: placeOfSupply
     };
   });
 }
@@ -110,7 +120,7 @@ async function fetchB2BSummary(startDate, endDate) {
 }
 
 /* ------------------------------------------------------------------------------------------------
-   FETCH: B2CS
+   FETCH B2CS DATA (NOW FIX POS)
 ------------------------------------------------------------------------------------------------ */
 async function fetchB2CSData(startDate, endDate) {
   const query = `
@@ -126,12 +136,18 @@ async function fetchB2CSData(startDate, endDate) {
     GROUP BY C.state_name, I.gst_rate
     ORDER BY C.state_name, I.gst_rate;
   `;
+
   const rows = await sequelize.query(query, { replacements: { startDate, endDate }, type: QueryTypes.SELECT });
-  return rows.map(r => ({ place_of_supply: r.place_of_supply, rate: parseFloat(r.rate || 0), total_taxable_value: parseFloat(r.total_taxable_value || 0) }));
+
+  return rows.map(r => ({
+    place_of_supply: formatPlaceOfSupplyFromName(r.place_of_supply), // ✅ FIX APPLIED
+    rate: parseFloat(r.rate || 0),
+    total_taxable_value: parseFloat(r.total_taxable_value || 0)
+  }));
 }
 
 /* ------------------------------------------------------------------------------------------------
-   FETCH: HSN SUMMARY
+   FETCH HSN SUMMARY (unchanged logic)
 ------------------------------------------------------------------------------------------------ */
 async function fetchHSNData(startDate, endDate, isB2B) {
   const gstFilter = isB2B
@@ -155,6 +171,7 @@ async function fetchHSNData(startDate, endDate, isB2B) {
     GROUP BY P.hsn_code, P.item_name, C.state_name
     ORDER BY P.hsn_code;
   `;
+
   const rows = await sequelize.query(query, { replacements: { startDate, endDate }, type: QueryTypes.SELECT });
 
   const grouped = {};
@@ -171,6 +188,7 @@ async function fetchHSNData(startDate, endDate, isB2B) {
         igst: 0, cgst: 0, sgst: 0, cess: 0
       };
     }
+
     grouped[key].total_quantity += parseFloat(r.total_quantity || 0);
     grouped[key].taxable_value += parseFloat(r.taxable_value || 0);
 
@@ -193,7 +211,7 @@ async function fetchHSNData(startDate, endDate, isB2B) {
 }
 
 /* ------------------------------------------------------------------------------------------------
-   SHARED STYLES
+   SHARED SHEET STYLE
 ------------------------------------------------------------------------------------------------ */
 const GST_HEADER_STYLE = {
   font: { bold: true },
@@ -204,7 +222,7 @@ const GST_HEADER_STYLE = {
 const BORDER = GST_HEADER_STYLE.border;
 
 /* ------------------------------------------------------------------------------------------------
-   SHEET: B2B
+   B2B SHEET
 ------------------------------------------------------------------------------------------------ */
 function addB2BSheet(workbook, data, summary) {
   const sheet = workbook.addWorksheet('B2B, SEZ, DE', { views: [{ state: 'frozen', ySplit: 4 }] });
@@ -213,17 +231,8 @@ function addB2BSheet(workbook, data, summary) {
   sheet.getCell('A1').value = 'Summary For B2B (4)';
   sheet.getCell('A1').font = { bold: true, size: 14 };
 
-  sheet.getCell('A2').value = 'No. of Recipients';
-  sheet.getCell('C2').value = 'No. of Invoices';
-  sheet.getCell('E2').value = 'Total Invoice Value';
-  sheet.getCell('L2').value = 'Taxable Value';
-  sheet.getCell('M2').value = 'Cess Amount';
-
-  sheet.getCell('A3').value = summary.num_recipients;
-  sheet.getCell('C3').value = summary.num_invoices;
-  sheet.getCell('E3').value = summary.total_invoice_value;
-  sheet.getCell('L3').value = summary.total_taxable_value;
-  sheet.getCell('M3').value = 0;
+  sheet.getRow(2).values = ['No. of Recipients', '', 'No. of Invoices', '', 'Total Invoice Value', '', '', '', '', '', '', 'Taxable Value', 'Cess Amount'];
+  sheet.getRow(3).values = [summary.num_recipients, '', summary.num_invoices, '', summary.total_invoice_value, '', '', '', '', '', '', summary.total_taxable_value, 0];
 
   const headers = [
     'GSTIN/UIN of Recipient', 'Receiver Name', 'Invoice Number', 'Invoice date',
@@ -239,14 +248,14 @@ function addB2BSheet(workbook, data, summary) {
       r.invoice_value, r.place_of_supply, 'N', '', 'Regular', '',
       r.gst_rate_applied, r.taxable_value, 0
     ]);
-    row.eachCell(c => (c.border = BORDER));
+    row.eachCell(c => c.border = BORDER);
   });
 
-  sheet.columns.forEach(col => (col.width = 20));
+  sheet.columns.forEach(col => col.width = 20);
 }
 
 /* ------------------------------------------------------------------------------------------------
-   SHEET: B2CS
+   B2CS SHEET (UPDATED POS)
 ------------------------------------------------------------------------------------------------ */
 function addB2CSSheet(workbook, rows) {
   const sheet = workbook.addWorksheet('B2CS');
@@ -254,24 +263,24 @@ function addB2CSSheet(workbook, rows) {
   sheet.getCell('A1').value = 'Summary For B2CS (7)';
   sheet.getCell('A1').font = { bold: true, size: 14 };
 
-  const totalTaxable = rows.reduce((sum, r) => sum + (r.total_taxable_value || 0), 0);
+  const totalTaxable = rows.reduce((sum, r) => sum + r.total_taxable_value, 0);
   sheet.getCell('E2').value = 'Total Taxable Value';
   sheet.getCell('E3').value = totalTaxable;
 
   const headers = ['Type', 'Place Of Supply', 'Applicable % Tax', 'Rate', 'Taxable Value', 'Cess Amount', 'E-Commerce GSTIN'];
   sheet.getRow(4).values = headers;
-  sheet.getRow(4).eachCell(c => (c.style = GST_HEADER_STYLE));
+  sheet.getRow(4).eachCell(c => c.style = GST_HEADER_STYLE);
 
   rows.forEach(r => {
     const row = sheet.addRow(['Other than E-commerce', r.place_of_supply, '', r.rate, r.total_taxable_value, 0, '']);
-    row.eachCell(c => (c.border = BORDER));
+    row.eachCell(c => c.border = BORDER);
   });
 
-  sheet.columns.forEach(col => (col.width = 20));
+  sheet.columns.forEach(col => col.width = 20);
 }
 
 /* ------------------------------------------------------------------------------------------------
-   SHEET: CDNR (STATIC, STYLED)
+   CDNR SHEET
 ------------------------------------------------------------------------------------------------ */
 function addCDNRSheet(workbook) {
   const sheet = workbook.addWorksheet("CDNR", { views: [{ state: 'frozen', ySplit: 4 }] });
@@ -281,20 +290,8 @@ function addCDNRSheet(workbook) {
   sheet.getCell("A1").font = { bold: true, size: 14 };
   sheet.getCell("A1").alignment = { horizontal: 'center' };
 
-  sheet.getCell("A2").value = "No. of Recipients";
-  sheet.getCell("A3").value = 0;
-
-  sheet.getCell("C2").value = "No. of Notes";
-  sheet.getCell("C3").value = 0;
-
-  sheet.getCell("I2").value = "Total Note Value";
-  sheet.getCell("I3").value = 9403.35;
-
-  sheet.getCell("L2").value = "Total Taxable Value";
-  sheet.getCell("L3").value = 0;
-
-  sheet.getCell("M2").value = "Total Cess";
-  sheet.getCell("M3").value = 0;
+  sheet.getRow(2).values = ["No. of Recipients", '', "No. of Notes", '', '', '', '', '', "Total Note Value", '', '', "Total Taxable Value", "Total Cess"];
+  sheet.getRow(3).values = [0, '', 0, '', '', '', '', '', 0, '', '', 0, 0];
 
   const headers = [
     "GSTIN/UIN of Recipient","Receiver Name","Note Number","Note date","Note Type",
@@ -302,49 +299,37 @@ function addCDNRSheet(workbook) {
     "Applicable % of Tax Rate","Rate","Taxable Value","Cess Amount"
   ];
   sheet.getRow(4).values = headers;
-  sheet.getRow(4).eachCell(c => (c.style = GST_HEADER_STYLE));
+  sheet.getRow(4).eachCell(c => c.style = GST_HEADER_STYLE);
 
-  sheet.columns.forEach(col => (col.width = 20));
+  sheet.columns.forEach(col => col.width = 20);
 }
 
 /* ------------------------------------------------------------------------------------------------
-   SHEET: CDNUR (STATIC, STYLED)
+   CDNUR SHEET
 ------------------------------------------------------------------------------------------------ */
 function addCDNURSheet(workbook) {
   const sheet = workbook.addWorksheet("CDNUR", { views: [{ state: 'frozen', ySplit: 4 }] });
 
-  // Title (match screenshot spec)
   sheet.mergeCells('A1:J1');
   sheet.getCell("A1").value = "Summary For CDNUR (9B)";
   sheet.getCell("A1").font = { bold: true, size: 14 };
   sheet.getCell("A1").alignment = { horizontal: 'center' };
 
-  // Summary fields (Row 2 labels, Row 3 values)
-  sheet.getCell("A2").value = "No. of Notes/Vouchers";
-  sheet.getCell("A3").value = 0;
+  sheet.getRow(2).values = ["No. of Notes/Vouchers", '', '', '', '', "Total Note Value", '', "Total Taxable Value", "Total Cess"];
+  sheet.getRow(3).values = [0, '', '', '', '', 0, '', 0, 0];
 
-  sheet.getCell("F2").value = "Total Note Value";
-  sheet.getCell("F3").value = 0;
-
-  sheet.getCell("I2").value = "Total Taxable Value";
-  sheet.getCell("I3").value = 0;
-
-  sheet.getCell("J2").value = "Total Cess";
-  sheet.getCell("J3").value = 0;
-
-  // Headers row (Row 4)
   const headers = [
     "UR Type", "Note Number", "Note date", "Note Type", "Place Of Supply",
     "Note Value", "Applicable % of Tax Rate", "Rate", "Taxable Value", "Cess Amount"
   ];
   sheet.getRow(4).values = headers;
-  sheet.getRow(4).eachCell(c => (c.style = GST_HEADER_STYLE));
+  sheet.getRow(4).eachCell(c => c.style = GST_HEADER_STYLE);
 
-  sheet.columns.forEach(col => (col.width = 20));
+  sheet.columns.forEach(col => col.width = 20);
 }
 
 /* ------------------------------------------------------------------------------------------------
-   SHEET: HSN SUMMARY
+   HSN SHEET
 ------------------------------------------------------------------------------------------------ */
 function addHSNSheet(workbook, hsnData, sheetName, title) {
   const sheet = workbook.addWorksheet(sheetName, { views: [{ state: 'frozen', ySplit: 2 }] });
@@ -359,14 +344,14 @@ function addHSNSheet(workbook, hsnData, sheetName, title) {
     'Taxable Value', 'Integrated Tax Amount', 'Central Tax Amount', 'State/UT Tax Amount', 'Cess Amount'
   ];
   sheet.getRow(2).values = headers;
-  sheet.getRow(2).eachCell(c => (c.style = GST_HEADER_STYLE));
+  sheet.getRow(2).eachCell(c => c.style = GST_HEADER_STYLE);
 
   let rowIndex = 3;
   hsnData.forEach(r => {
     const row = sheet.getRow(rowIndex++);
     row.values = [
       r.hsn, r.description, r.uqc, r.total_quantity,
-      r.total_value, "", r.taxable_value, r.igst, r.cgst, r.sgst, r.cess
+      r.total_value, '', r.taxable_value, r.igst, r.cgst, r.sgst, r.cess
     ];
     row.eachCell(c => (c.border = BORDER));
   });
@@ -393,8 +378,8 @@ async function generateGstr1Report(startDate, endDate) {
   const workbook = new ExcelJS.Workbook();
   addB2BSheet(workbook, b2bData, b2bSummary);
   addB2CSSheet(workbook, b2csData);
-  addCDNRSheet(workbook);    // Styled static CDNR
-  addCDNURSheet(workbook);   // Styled static CDNUR
+  addCDNRSheet(workbook);
+  addCDNURSheet(workbook);
   addHSNSheet(workbook, hsnB2B, "HSN (B2B)", "Summary For HSN B2B");
   addHSNSheet(workbook, hsnB2C, "HSN (B2C)", "Summary For HSN B2C");
 
