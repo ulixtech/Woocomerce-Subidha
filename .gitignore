@@ -1,0 +1,12 @@
+# Dependency files
+/node_modules
+
+# Environment variables
+.env
+
+# Log files
+npm-debug.log
+
+# Uploads and Downloads
+/uploads
+/downloads
